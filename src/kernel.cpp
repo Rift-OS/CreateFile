@@ -1,23 +1,18 @@
-#include "timer.h" // 既存のタイマー（C互換）
 #include "vfs.hpp"
 
-// C++のグローバルオブジェクトとしてVFSを定義
 RiftOS::VirtualFileSystem g_vfs;
 
 extern "C" void kernel_main() {
-    // タイマー初期化
-    init_sleep_timer();
-
-    // C++のオブジェクト指向スタイルでファイルを新規作成
-    int fd = g_vfs.CreateFile("LOG.TXT", RiftOS::FileAttribute::Normal);
+    // 起動時にファイルシステムモジュールからファイルを新規作成
+    int fd = g_vfs.CreateFile("SYS.LOG", RiftOS::FileAttribute::Normal);
 
     if (fd >= 0) {
-        // 作成成功
+        // ファイル作成成功時の処理
     } else {
-        // 作成失敗
+        // エラー処理
     }
 
     while (true) {
-        msleep(1000);
+        __asm__ volatile("hlt");
     }
 }
