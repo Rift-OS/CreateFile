@@ -6,7 +6,6 @@
 
 namespace RiftOS {
 
-// ファイル属性の列挙型
 enum class FileAttribute : uint8_t {
     Normal    = 0x00,
     ReadOnly  = 0x01,
@@ -14,7 +13,6 @@ enum class FileAttribute : uint8_t {
     Directory = 0x10
 };
 
-// 個々のファイルを表現するクラス
 class FileHandle {
 public:
     char filename[12];
@@ -31,7 +29,6 @@ public:
     void close() { is_opened = false; }
 };
 
-// ファイルシステム全体を管理するクラス
 class VirtualFileSystem {
 private:
     static constexpr size_t MAX_OPEN_FILES = 16;
