@@ -20,6 +20,7 @@ int VirtualFileSystem::CreateFile(const char* path, FileAttribute attr) {
     }
 
     size_t j = 0;
+    // filename[12] に対して、最大11文字まで path からコピーします（残る1要素をヌル終端に使用）
     for (j = 0; j < 11 && path[j] != '\0'; ++j) {
         file_table[fd].filename[j] = path[j];
     }
