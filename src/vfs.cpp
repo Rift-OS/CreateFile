@@ -1,68 +1,97 @@
-#include "vfs.hpp"
-#include <cstring> // memcpy, strncmp 等の代用（OS自作時は自前実装に置き換え）
+#include "vfs_improved.hpp"
 
 namespace RiftOS {
 
-bool VirtualFileSystem::IsFilenameEqual(const char* path, const char* filename) {
-    return std::strncmp(path, filename, 11) == 0;
-}
-
-// 仮想的なクラスタ割り当て関数（本来はFATやBitmapを操作する）
-uint32_t VirtualFileSystem::AllocateNewCluster() {
-    static uint32_t next_free_cluster = 100; // ダミーの開始番号
-    return next_free_cluster++;
-}
-
-// ストレージ（下位ドライバ）への書き込みを仲介するスタブ
-void VirtualFileSystem::WriteToStorage(uint32_t cluster, size_t offset, const void* buffer, size_t size) {
-    // TODO: ここで実際のディスクドライバ（ATA, AHCI, SDカード等）の
-    // セクタ書き込み関数を呼び出します。
-    (void)cluster; (void)offset; (void)buffer; (void)size;
-}
-
-// ストレージ（下位ドライバ）からの読み込みを仲介するスタブ
-void VirtualFileSystem::ReadFromStorage(uint32_t cluster, size_t offset, void* buffer, size_t size) {
-    // TODO: ここで実際のディスクドライバのセクタ読み込み関数を呼び出します。
-    (void)cluster; (void)offset; (void)buffer; (void)size;
-}
-
-
-VirtualFileSystem::VirtualFileSystem() {
+// =============================================================================
+// 初期化
+// =============================================================================
+VirtualFileSystem::VirtualFileSystem() : next_free_cluster(100) {
     for (size_t i = 0; i < MAX_OPEN_FILES; ++i) {
         file_table[i].Clear();
     }
 }
 
-// 1. ファイルの新規作成
-int VirtualFileSystem::CreateFile(const char* path, FileAttribute attr) {
-    if (!path) return -1;
+// =============================================================================
+// ヘルパー関数
+// =============================================================================
 
-    // 重複チェック: 既に同じ名前のファイルが登録・オープンされていないか
+bool VirtualFileSystem::IsFilenameEqual(const char* path, const char* filename) {
+    if (!path || !filename) return false;
+    return std::strncmp(path, filename, MAX_FILENAME_LENGTH) == 0;
+}
+
+bool VirtualFileSystem::IsValidFilename(const char* path) {
+    if (!path || path[0] == '\0') return false;
+    if (std::strlen(path) >= MAX_FILENAME_LENGTH) return false;
+    
+    // ファイル名として不正な文字をチェック（OS依存で調整可能）
+    const char* invalid_chars = "<>:\"|?*";
+    for (const char* p = path; *p; ++p) {
+        for (const char* invalid = invalid_chars; *invalid; ++invalid) {
+            if (*p == *invalid) return false;
+        }
+    }
+    return true;
+}
+
+int VirtualFileSystem::FindFileInTable(const char* path) {
     for (size_t i = 0; i < MAX_OPEN_FILES; ++i) {
         if (file_table[i].is_opened && IsFilenameEqual(path, file_table[i].filename)) {
-            return -1; // エラー: 既に存在する
+            return static_cast<int>(i);
         }
     }
+    return -1;
+}
 
-    // 空き記述子（FD）の検索
-    int fd = -1;
+int VirtualFileSystem::FindFreeDescriptor() {
     for (size_t i = 0; i < MAX_OPEN_FILES; ++i) {
         if (!file_table[i].is_opened) {
-            fd = static_cast<int>(i);
-            break;
+            return static_cast<int>(i);
         }
     }
-    if (fd == -1) return -1; // エラー: テーブル満杯
+    return -1;
+}
 
-    // 新規ファイル用のストレージ領域（初期クラスタ）の確保
-    uint32_t new_cluster = AllocateNewCluster();
+void VirtualFileSystem::SyncFileMetadata(int fd) {
+    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) return;
+    if (!file_table[fd].is_opened || !file_table[fd].is_modified) return;
 
-    // 構造体の初期化
-    size_t j = 0;
-    for (j = 0; j < 11 && path[j] != '\0'; ++j) {
-        file_table[fd].filename[j] = path[j];
+    // TODO: メタデータをディスク上のディレクトリエントリに書き込む
+    // （ファイルサイズ、更新時刻、属性など）
+    file_table[fd].is_modified = false;
+}
+
+// =============================================================================
+// ファイル操作
+// =============================================================================
+
+int VirtualFileSystem::CreateFile(const char* path, FileAttribute attr) {
+    // 入力検証
+    if (!IsValidFilename(path)) {
+        return static_cast<int>(FileSystemError::FilenameInvalid);
     }
-    file_table[fd].filename[j] = '\0';
+
+    // 重複チェック
+    if (FindFileInTable(path) != -1) {
+        return static_cast<int>(FileSystemError::FileAlreadyExists);
+    }
+
+    // 空き記述子の検索
+    int fd = FindFreeDescriptor();
+    if (fd == -1) {
+        return static_cast<int>(FileSystemError::TableFull);
+    }
+
+    // 新規ファイル用のクラスタ確保
+    uint32_t new_cluster = AllocateNewCluster();
+    if (new_cluster == INVALID_CLUSTER) {
+        return static_cast<int>(FileSystemError::IOError);
+    }
+
+    // 記述子の初期化
+    std::memset(file_table[fd].filename, 0, MAX_FILENAME_LENGTH);
+    std::strncpy(file_table[fd].filename, path, MAX_FILENAME_LENGTH - 1);
+    file_table[fd].filename[MAX_FILENAME_LENGTH - 1] = '\0';
 
     file_table[fd].attr = attr;
     file_table[fd].file_size = 0;
@@ -70,127 +99,308 @@ int VirtualFileSystem::CreateFile(const char* path, FileAttribute attr) {
     file_table[fd].current_cluster = new_cluster;
     file_table[fd].current_pos = 0;
     file_table[fd].is_opened = true;
+    file_table[fd].open_count = 1;
+    file_table[fd].is_modified = true;
 
-    // TODO: 本来はここで「親ディレクトリのセクタ」にもこのファイル名と初期クラスタを書き込む
+    // ディスク上のディレクトリにも登録
+    SyncFileMetadata(fd);
 
     return fd;
 }
 
-// 2. 既存ファイルを開く
 int VirtualFileSystem::OpenFile(const char* path) {
-    if (!path) return -1;
+    // 入力検証
+    if (!IsValidFilename(path)) {
+        return static_cast<int>(FileSystemError::FilenameInvalid);
+    }
 
-    // 本来はディスク上（ディレクトリ内）を走査して探しますが、
-    // ここでは簡易的に「既にfile_tableに登録されているもの」から探します
-    for (size_t i = 0; i < MAX_OPEN_FILES; ++i) {
-        if (file_table[i].is_opened && IsFilenameEqual(path, file_table[i].filename)) {
-            // 見つかったらシーク位置を先頭に戻してFDを返す
-            file_table[i].current_pos = 0;
-            file_table[i].current_cluster = file_table[i].start_cluster;
-            return static_cast<int>(i);
+    // ファイルテーブル内で検索
+    int fd = FindFileInTable(path);
+    if (fd != -1) {
+        // 既に開かれている場合
+        if (file_table[fd].open_count < 128) {  // 開き過ぎを防止
+            file_table[fd].open_count++;
+            file_table[fd].current_pos = 0;
+            file_table[fd].current_cluster = file_table[fd].start_cluster;
+            return fd;
+        }
+        return static_cast<int>(FileSystemError::PermissionDenied);
+    }
+
+    // ファイルが見つからない場合は新たな記述子を探す（ディスク検索は本来ここで実施）
+    return static_cast<int>(FileSystemError::FileNotFound);
+}
+
+int VirtualFileSystem::CloseFile(int fd) {
+    // バリデーション
+    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) {
+        return static_cast<int>(FileSystemError::InvalidDescriptor);
+    }
+
+    OpenFileDescriptor& file = file_table[fd];
+    if (!file.is_opened) {
+        return static_cast<int>(FileSystemError::InvalidDescriptor);
+    }
+
+    // 参照カウントをデクリメント
+    if (file.open_count > 0) {
+        file.open_count--;
+    }
+
+    // 最後のクローザーがメタデータを同期
+    if (file.open_count == 0) {
+        if (file.is_modified) {
+            SyncFileMetadata(fd);
+        }
+        file.Clear();
+    }
+
+    return static_cast<int>(FileSystemError::Success);
+}
+
+int VirtualFileSystem::DeleteFile(const char* path) {
+    if (!IsValidFilename(path)) {
+        return static_cast<int>(FileSystemError::FilenameInvalid);
+    }
+
+    int fd = FindFileInTable(path);
+    if (fd == -1) {
+        return static_cast<int>(FileSystemError::FileNotFound);
+    }
+
+    // 開かれているファイルは削除不可
+    if (file_table[fd].open_count > 0) {
+        return static_cast<int>(FileSystemError::PermissionDenied);
+    }
+
+    // TODO: クラスタをFATで解放
+    // TODO: ディレクトリエントリから削除
+
+    file_table[fd].Clear();
+    return static_cast<int>(FileSystemError::Success);
+}
+
+// =============================================================================
+// 読み書き操作
+// =============================================================================
+
+int VirtualFileSystem::ReadFile(int fd, void* buffer, size_t size) {
+    // バリデーション
+    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) {
+        return static_cast<int>(FileSystemError::InvalidDescriptor);
+    }
+
+    if (!buffer || size == 0) {
+        return 0;
+    }
+
+    OpenFileDescriptor& file = file_table[fd];
+    if (!file.is_opened) {
+        return static_cast<int>(FileSystemError::InvalidDescriptor);
+    }
+
+    // EOFチェック
+    if (file.current_pos >= file.file_size) {
+        return static_cast<int>(FileSystemError::EndOfFile);
+    }
+
+    // 読み込み可能なサイズに調整
+    size_t bytes_to_read = std::min(size, static_cast<size_t>(file.file_size - file.current_pos));
+
+    // 複数クラスタにまたがる読み込みに対応
+    size_t bytes_read = 0;
+    uint32_t current_cluster = file.current_cluster;
+    size_t cluster_offset = file.current_pos % CLUSTER_SIZE;
+
+    while (bytes_to_read > 0) {
+        // 現在のクラスタから読み込める最大サイズ
+        size_t bytes_in_cluster = CLUSTER_SIZE - cluster_offset;
+        size_t chunk_size = std::min(bytes_to_read, bytes_in_cluster);
+
+        // ストレージから読み込み
+        ReadFromStorage(current_cluster, cluster_offset, 
+                       static_cast<uint8_t*>(buffer) + bytes_read, chunk_size);
+
+        bytes_read += chunk_size;
+        bytes_to_read -= chunk_size;
+        file.current_pos += chunk_size;
+
+        // 次のクラスタへ移動
+        if (bytes_to_read > 0) {
+            current_cluster = AllocateNewCluster();  // TODO: FAT参照に置き換え
+            cluster_offset = 0;
         }
     }
-    return -1; // ファイルが見つからない
+
+    file.current_cluster = current_cluster;
+    return static_cast<int>(bytes_read);
 }
 
-// 3. ファイルを閉じる
-int VirtualFileSystem::CloseFile(int fd) {
-    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) return -1;
-    if (!file_table[fd].is_opened) return -1;
-
-    // TODO: キャッシュしているデータがあればここでディスクにフラッシュする
-    
-    file_table[fd].Clear();
-    return 0;
-}
-
-// 4. ファイルからの読み込み
-int VirtualFileSystem::ReadFile(int fd, void* buffer, size_t size) {
-    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) return -1;
-    OpenFileDescriptor& file = file_table[fd];
-    if (!file.is_opened) return -1;
-
-    // 読み込みサイズがファイル末尾を超えないように調整
-    if (file.current_pos + size > file.file_size) {
-        size = file.file_size - file.current_pos;
-    }
-    if (size == 0) return 0; // 既にEOF（末尾）
-
-    // クラスタ内のオフセット計算
-    size_t cluster_offset = file.current_pos % CLUSTER_SIZE;
-    
-    // 実際の低レイヤ読み込み処理を呼び出し
-    ReadFromStorage(file.current_cluster, cluster_offset, buffer, size);
-
-    // シーク位置の更新
-    file.current_pos += size;
-    
-    // もし次のクラスタに跨る場合は、本来ここでFAT等を参照して current_cluster を更新する
-    // file.current_cluster = GetNextCluster(file.current_cluster);
-
-    return static_cast<int>(size); // 読み込んだバイト数を返す
-}
-
-// 5. ファイルへの書き込み
 int VirtualFileSystem::WriteFile(int fd, const void* buffer, size_t size) {
-    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) return -1;
-    OpenFileDescriptor& file = file_table[fd];
-    if (!file.is_opened) return -1;
-    if (size == 0) return 0;
+    // バリデーション
+    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) {
+        return static_cast<int>(FileSystemError::InvalidDescriptor);
+    }
 
+    if (!buffer || size == 0) {
+        return 0;
+    }
+
+    OpenFileDescriptor& file = file_table[fd];
+    if (!file.is_opened) {
+        return static_cast<int>(FileSystemError::InvalidDescriptor);
+    }
+
+    // 読み取り専用チェック
+    if ((static_cast<int>(file.attr) & static_cast<int>(FileAttribute::ReadOnly)) != 0) {
+        return static_cast<int>(FileSystemError::PermissionDenied);
+    }
+
+    // 複数クラスタにまたがる書き込みに対応
+    size_t bytes_written = 0;
+    uint32_t current_cluster = file.current_cluster;
     size_t cluster_offset = file.current_pos % CLUSTER_SIZE;
 
-    // もし書き込むことでクラスタの境界を超える場合、
-    // 本来はループ処理で新しいクラスタを割り当てながら書き込みますが、ここでは1クラスタ内として処理
-    WriteToStorage(file.current_cluster, cluster_offset, buffer, size);
+    while (size > 0) {
+        // 現在のクラスタに書き込める最大サイズ
+        size_t bytes_in_cluster = CLUSTER_SIZE - cluster_offset;
+        size_t chunk_size = std::min(size, bytes_in_cluster);
 
-    // シーク位置の更新
-    file.current_pos += size;
+        // ストレージに書き込み
+        WriteToStorage(current_cluster, cluster_offset,
+                      static_cast<const uint8_t*>(buffer) + bytes_written, chunk_size);
 
-    // 追記された場合はファイルサイズを更新
+        bytes_written += chunk_size;
+        size -= chunk_size;
+        file.current_pos += chunk_size;
+
+        // 次のクラスタを割り当て
+        if (size > 0) {
+            current_cluster = AllocateNewCluster();
+            if (current_cluster == INVALID_CLUSTER) {
+                return static_cast<int>(FileSystemError::IOError);
+            }
+            cluster_offset = 0;
+        }
+    }
+
+    // ファイルサイズを更新
     if (file.current_pos > file.file_size) {
         file.file_size = file.current_pos;
+        file.is_modified = true;
     }
 
-    return static_cast<int>(size); // 書き込んだバイト数を返す
+    file.current_cluster = current_cluster;
+    return static_cast<int>(bytes_written);
 }
 
-// 6. シーク（読み書き位置の移動）
-int VirtualFileSystem::SeekFile(int fd, int offset, int whence) {
-    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) return -1;
-    OpenFileDescriptor& file = file_table[fd];
-    if (!file.is_opened) return -1;
+// =============================================================================
+// シーク操作
+// =============================================================================
 
-    size_t new_pos = file.current_pos;
+int VirtualFileSystem::SeekFile(int fd, int offset, int whence) {
+    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) {
+        return static_cast<int>(FileSystemError::InvalidDescriptor);
+    }
+
+    OpenFileDescriptor& file = file_table[fd];
+    if (!file.is_opened) {
+        return static_cast<int>(FileSystemError::InvalidDescriptor);
+    }
+
+    uint32_t new_pos = file.current_pos;
 
     switch (whence) {
         case 0: // SEEK_SET: ファイル先頭から
-            if (offset < 0) return -1;
-            new_pos = static_cast<size_t>(offset);
+            if (offset < 0) {
+                return static_cast<int>(FileSystemError::InvalidOffset);
+            }
+            new_pos = static_cast<uint32_t>(offset);
             break;
+
         case 1: // SEEK_CUR: 現在位置から
-            if (static_cast<int>(file.current_pos) + offset < 0) return -1;
+            if ((static_cast<int>(file.current_pos) + offset) < 0) {
+                return static_cast<int>(FileSystemError::InvalidOffset);
+            }
             new_pos = file.current_pos + offset;
             break;
+
         case 2: // SEEK_END: ファイル末尾から
-            if (static_cast<int>(file.file_size) + offset < 0) return -1;
+            if ((static_cast<int>(file.file_size) + offset) < 0) {
+                return static_cast<int>(FileSystemError::InvalidOffset);
+            }
             new_pos = file.file_size + offset;
             break;
+
         default:
-            return -1;
+            return static_cast<int>(FileSystemError::InvalidOffset);
     }
 
-    // ファイルサイズを超えるシークを禁止する場合（OSの仕様に依存）
+    // ファイルサイズ超過チェック
     if (new_pos > file.file_size) {
-        return -1;
+        return static_cast<int>(FileSystemError::InvalidOffset);
     }
 
+    // クラスタチェーンの辿り直し（本来はFAT参照）
+    // TODO: start_clusterからFATを参照して new_pos に対応するクラスタを計算
     file.current_pos = new_pos;
-    
-    // 本来はここで、新しい new_pos に合わせて start_cluster からクラスタチェーンを辿り、
-    // file.current_cluster も正しい位置に同期させる処理が必要になります。
+    file.current_cluster = file.start_cluster;  // 簡略化のため先頭クラスタに戻す
 
-    return static_cast<int>(file.current_pos);
+    return static_cast<int>(new_pos);
+}
+
+// =============================================================================
+// ファイル情報取得
+// =============================================================================
+
+uint32_t VirtualFileSystem::GetFilePosition(int fd) const {
+    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) return 0;
+    if (!file_table[fd].is_opened) return 0;
+    return file_table[fd].current_pos;
+}
+
+uint32_t VirtualFileSystem::GetFileSize(int fd) const {
+    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) return 0;
+    if (!file_table[fd].is_opened) return 0;
+    return file_table[fd].file_size;
+}
+
+bool VirtualFileSystem::IsFileOpen(int fd) const {
+    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) return false;
+    return file_table[fd].is_opened;
+}
+
+const char* VirtualFileSystem::GetFilename(int fd) const {
+    if (fd < 0 || fd >= static_cast<int>(MAX_OPEN_FILES)) return nullptr;
+    if (!file_table[fd].is_opened) return nullptr;
+    return file_table[fd].filename;
+}
+
+// =============================================================================
+// ストレージ操作
+// =============================================================================
+
+uint32_t VirtualFileSystem::AllocateNewCluster() {
+    // 本来はFATやBitmapを参照して空きクラスタを探す
+    // ここではダミー実装
+    if (next_free_cluster >= 0xFFFFFFF0) {  // オーバーフロー防止
+        return INVALID_CLUSTER;
+    }
+    return next_free_cluster++;
+}
+
+void VirtualFileSystem::WriteToStorage(uint32_t cluster, size_t offset, 
+                                       const void* buffer, size_t size) {
+    (void)cluster; (void)offset; (void)buffer; (void)size;
+    // TODO: 実際のディスク書き込みドライバ（ATA, AHCI, SDカード）を呼び出す
+    // 例: disk_driver_write_sector(cluster, buffer, size);
+}
+
+void VirtualFileSystem::ReadFromStorage(uint32_t cluster, size_t offset,
+                                        void* buffer, size_t size) {
+    (void)cluster; (void)offset; (void)buffer; (void)size;
+    // TODO: 実際のディスク読み込みドライバを呼び出す
+    // 例: disk_driver_read_sector(cluster, buffer, size);
 }
 
 } // namespace RiftOS
